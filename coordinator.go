@@ -107,7 +107,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
-	log "github.com/sirupsen/logrus"
 )
 
 // CoordinatorDynamoClient defines the minimal DynamoDB operations required.
@@ -329,11 +328,6 @@ func (c *Coordinator) Stop(ctx context.Context) error {
 		// (which would just mean someone else took leadership already)
 		var ccfe *types.ConditionalCheckFailedException
 		if err != nil && !errors.As(err, &ccfe) {
-			log.WithFields(log.Fields{
-				"shard": c.cfg.ShardID,
-				"owner": c.cfg.OwnerID,
-				"error": err,
-			}).Error("Error releasing leadership lock")
 			return err
 		}
 	}
@@ -417,21 +411,9 @@ func (c *Coordinator) tryAcquire(ctx context.Context) bool {
 		// This is normal in leader election - silently return false
 		return false
 	} else if err != nil {
-		// Log other errors as they might indicate real problems
-		log.WithFields(log.Fields{
-			"shard": c.cfg.ShardID,
-			"owner": c.cfg.OwnerID,
-			"error": err,
-		}).Error("Error trying to acquire lock")
 		return false
 	}
 
-	// Only log successful acquisition
-	// log.WithFields(log.Fields{
-	// 	"shard": c.cfg.ShardID,
-	// 	"owner": c.cfg.OwnerID,
-	// 	"ttl":   ttl,
-	// }).Info("Successfully acquired leadership")
 	return true
 }
 
@@ -463,12 +445,6 @@ func (c *Coordinator) renew(ctx context.Context) bool {
 		// Don't log this as it's normal operation
 		return false
 	} else if err != nil {
-		// Log other errors as they might indicate real problems
-		log.WithFields(log.Fields{
-			"shard": c.cfg.ShardID,
-			"owner": c.cfg.OwnerID,
-			"error": err,
-		}).Error("Error trying to renew lock")
 		return false
 	}
 
