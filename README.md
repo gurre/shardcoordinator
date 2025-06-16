@@ -1,5 +1,10 @@
 # Shard Coordinator
 
+
+[![Go Reference](https://pkg.go.dev/badge/github.com/gurre/shardcoordinator.svg)](https://pkg.go.dev/github.com/gurre/shardcoordinator)
+[![Go Report Card](https://goreportcard.com/badge/github.com/gurre/shardcoordinator)](https://goreportcard.com/report/github.com/gurre/shardcoordinator)
+
+
 A fault-tolerant distributed leader election library for Go applications using DynamoDB as the coordination backend. This library implements a lease-based approach where coordinators continually renew their leadership to maintain control of logical shards.
 
 ## Features
@@ -14,7 +19,7 @@ A fault-tolerant distributed leader election library for Go applications using D
 ## Installation
 
 ```bash
-go get github.com/yourusername/shardcoordinator
+go get github.com/gurre/shardcoordinator
 ```
 
 ## Quick Start
@@ -87,9 +92,9 @@ aws dynamodb create-table \
         AttributeName=pk,KeyType=HASH \
         AttributeName=sk,KeyType=RANGE \
     --billing-mode PAY_PER_REQUEST \
-	--time-to-live-specification \
+    --time-to-live-specification \
         Enabled=true,AttributeName=ttl \
-    --region your-region
+    --region ${AWS_REGION}
 ```
 
 ## Configuration
@@ -136,20 +141,6 @@ Each caller treats "conditional-check failed" as "I am follower", so there is ne
 
 **Zero-downtime leadership transitions**: When a leader crashes or becomes unavailable, new coordinators can claim leadership the moment the TTL expires, ensuring continuous coverage without waiting for DynamoDB's background cleanup processes.
 
-### Seamless Leadership Continuity
-
-This library includes advanced lease acquisition logic that surpasses basic leader election implementations:
-
-```
-ConditionExpression = "attribute_not_exists(pk) OR (attribute_exists(pk) AND #t < :now)"
-```
-
-**Key Benefits:**
-- **No service interruption**: Leadership transfers happen instantly when TTLs expire
-- **Atomic operations**: Each acquisition is a single atomic PutItem with full consistency guarantees  
-- **Superior to basic implementations**: Eliminates the coordination gaps that plague simpler `attribute_not_exists(pk)` approaches
-- **Production-ready**: Handles real-world scenarios like network partitions and process crashes gracefully
-
 ## How Recovery Happens
 
 | Phase | What the coordinator does | Observable effect |
@@ -157,18 +148,6 @@ ConditionExpression = "attribute_not_exists(pk) OR (attribute_exists(pk) AND #t 
 | Renew fails (I/O error, timeout, or ConditionalCheckFailed) | Immediately transitions from leader to follower state | Leader stops running immediately |
 | Still partitioned | Keeps trying tryAcquire as a follower. All calls will fail while the old lock row is present and unexpired | Only one leader exists; your demoted node stays passive |
 | Lock row expires (TTL) or another node overwrites it | Regular tryAcquire eventually succeeds; this node may become leader again | System converges to exactly one leader |
-
-### Why This Design Excels
-
-- **Minimal split-brain exposure**: The longest a partitioned leader can "believe" it is still leader is one RenewPeriod, not the full LeaseDuration. The implementation immediately transitions to follower state on any renewal failure.
-
-- **Instant state transitions**: When a renewal fails, the coordinator immediately flips its internal state to follower. Applications checking `IsLeader()` will see the state change right away, enabling rapid response to leadership changes.
-
-- **Robust lock management**: The lock row stays intact until its TTL passes or another node overwrites it with the enhanced condition expression. DynamoDB's atomic conditions ensure only one owner at a time while enabling seamless handoffs.
-
-### Optional Hardening
-
-If you want still faster reaction to a lost lock, lower RenewPeriod for more frequent renewal attempts, or implement custom error handling and back-pressure strategies in your application logic.
 
 ## Leadership Lifecycle
 
@@ -185,30 +164,4 @@ graph TD
     B --> F
     F --> G[Release Lock if Leader]
     G --> H[End]
-```
-
-### State Transitions
-
-1. **Startup**: All coordinators start as followers
-2. **Acquisition**: Followers periodically attempt to acquire leadership
-3. **Leadership**: Leaders periodically renew their lease
-4. **Failover**: Failed renewals cause automatic transition to follower
-5. **Shutdown**: Graceful release of leadership during stop
-
-## Best Practices
-
-### Graceful Shutdown
-Always call `Stop()` to release leadership cleanly:
-
-```go
-// Handle shutdown signals
-c := make(chan os.Signal, 1)
-signal.Notify(c, os.Interrupt, syscall.SIGTERM)
-
-go func() {
-    <-c
-    log.Println("Shutting down...")
-    coordinator.Stop(context.Background())
-    os.Exit(0)
-}()
 ```
