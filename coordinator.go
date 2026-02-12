@@ -1,5 +1,6 @@
 // Package shardcoordinator provides distributed leader election for logical shards.
-// It implements a fault-tolerant leader election mechanism using DynamoDB as a coordination backend.
+// It implements a fault-tolerant leader election mechanism using pluggable locker backends
+// such as DynamoDB, Route53, or custom implementations.
 // The implementation uses a lease-based approach where a coordinator continually renews its leadership
 // to maintain control of a shard.
 //
@@ -100,37 +101,47 @@ package shardcoordinator
 import (
 	"context"
 	"errors"
-	"fmt"
 	"sync"
 	"time"
-
-	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
-	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 )
 
-// CoordinatorDynamoClient defines the minimal DynamoDB operations required.
-// This interface allows for mocking in tests.
-type CoordinatorDynamoClient interface {
-	PutItem(ctx context.Context, params *dynamodb.PutItemInput, optFns ...func(*dynamodb.Options)) (*dynamodb.PutItemOutput, error)
-	DeleteItem(ctx context.Context, params *dynamodb.DeleteItemInput, optFns ...func(*dynamodb.Options)) (*dynamodb.DeleteItemOutput, error)
-	UpdateItem(ctx context.Context, params *dynamodb.UpdateItemInput, optFns ...func(*dynamodb.Options)) (*dynamodb.UpdateItemOutput, error)
+// Locker defines distributed lock operations for shard coordination.
+// Implementations must provide atomic compare-and-swap semantics.
+type Locker interface {
+	// TryAcquire attempts atomic lock acquisition.
+	// Returns true if acquired, false if already held by another owner with valid TTL (future expiration).
+	TryAcquire(ctx context.Context, shardID string, ownerID string, ttl time.Time) (bool, error)
+
+	// Renew extends lock TTL if caller is the owner.
+	// Returns true if renewed, false if ownership changed or lock has already expired.
+	Renew(ctx context.Context, shardID string, ownerID string, ttl time.Time) (bool, error)
+
+	// Release deletes lock if caller is the owner.
+	// Returns error only for infrastructure failures.
+	Release(ctx context.Context, shardID string, ownerID string) error
 }
 
 // Coordinator manages the leader election process for a logical shard.
-// It maintains leadership by periodically renewing a lease in DynamoDB.
+// It maintains leadership by periodically renewing a lease using a pluggable Locker backend.
 // Only one coordinator can be the leader for a given shard at any time.
 //
 // Example usage:
 //
+//	// Create a DynamoDB-based locker
+//	awsConfig, _ := config.LoadDefaultConfig(context.TODO())
+//	dynamoClient := dynamodb.NewFromConfig(awsConfig)
+//	locker, _ := dynamolock.New(dynamolock.Config{
+//	    Table:  "coordination-table",
+//	    Client: dynamoClient,
+//	})
+//
 //	// Create a coordinator for a specific shard
 //	cfg := shardcoordinator.Config{
-//	    Table:         "coordination-table",
 //	    ShardID:       "analytics-task",
 //	    OwnerID:       "worker-a937bc",
 //	    LeaseDuration: 30 * time.Second,
 //	    RenewPeriod:   10 * time.Second,
-//	    AWS:           awsConfig,
+//	    Locker:        locker,
 //	}
 //
 //	coordinator, err := shardcoordinator.New(cfg)
@@ -159,17 +170,14 @@ type CoordinatorDynamoClient interface {
 //	coordinator.Stop(ctx)
 type Coordinator struct {
 	cfg     Config
-	db      CoordinatorDynamoClient
+	locker  Locker
 	state   role
 	stateMu sync.RWMutex
 	stop    context.CancelFunc
 }
 
 // Config carries everything the ShardCoordinator needs to run.
-// All fields are required except AWS, which can be omitted when using
-// a custom DynamoDB client.
 type Config struct {
-	Table   string // DynamoDB table name (single-table design with pk/sk keys)
 	ShardID string // Logical shard/group this coordinator will guard, e.g. "analytics"
 	OwnerID string // Unique worker ID, e.g. hostname-PID-UUID. Used as lock owner.
 
@@ -192,7 +200,7 @@ type Config struct {
 	// Typical range: 5-20 seconds. Default recommendation: 5 seconds.
 	RenewPeriod time.Duration
 
-	AWS aws.Config // Pre-configured AWS SDK v2 session (region, creds, retry, etc.)
+	Locker Locker // Distributed lock backend (required)
 }
 
 // role represents the state of the coordinator: leader or follower.
@@ -213,27 +221,35 @@ const (
 //	hostname, _ := os.Hostname()
 //	ownerID := fmt.Sprintf("%s-%d-%s", hostname, os.Getpid(), uuid.New().String())
 //
+//	// Create a locker backend
+//	locker, _ := dynamolock.New(dynamolock.Config{
+//	    Table:  "my-coordination-table",
+//	    Client: dynamoClient,
+//	})
+//
 //	cfg := shardcoordinator.Config{
-//	    Table:         "my-coordination-table",
 //	    ShardID:       "batch-processor",
 //	    OwnerID:       ownerID,
 //	    LeaseDuration: 30 * time.Second,
 //	    RenewPeriod:   10 * time.Second,
-//	    AWS:           awsConfig,
+//	    Locker:        locker,
 //	}
 //
 //	coordinator, err := shardcoordinator.New(cfg)
 func New(cfg Config) (*Coordinator, error) {
-	if cfg.Table == "" || cfg.ShardID == "" || cfg.OwnerID == "" {
+	if cfg.ShardID == "" || cfg.OwnerID == "" {
 		return nil, errors.New("missing mandatory config")
+	}
+	if cfg.Locker == nil {
+		return nil, errors.New("Locker is required")
 	}
 	if cfg.RenewPeriod >= cfg.LeaseDuration {
 		return nil, errors.New("RenewPeriod must be < LeaseDuration")
 	}
 	return &Coordinator{
-		cfg:   cfg,
-		db:    dynamodb.NewFromConfig(cfg.AWS),
-		state: follower,
+		cfg:    cfg,
+		locker: cfg.Locker,
+		state:  follower,
 	}, nil
 }
 
@@ -312,24 +328,9 @@ func (c *Coordinator) Stop(ctx context.Context) error {
 	c.state = follower
 	c.stateMu.Unlock()
 
-	// Only try to delete the lock if we were the leader
+	// Only try to release the lock if we were the leader
 	if isLeader {
-		// Delete item if it still belongs to us
-		_, err := c.db.DeleteItem(ctx, &dynamodb.DeleteItemInput{
-			TableName:           &c.cfg.Table,
-			Key:                 c.key(),
-			ConditionExpression: aws.String("ownerId = :me"),
-			ExpressionAttributeValues: map[string]types.AttributeValue{
-				":me": &types.AttributeValueMemberS{Value: c.cfg.OwnerID},
-			},
-		})
-
-		// Only consider it an error if it's not a conditional check failure
-		// (which would just mean someone else took leadership already)
-		var ccfe *types.ConditionalCheckFailedException
-		if err != nil && !errors.As(err, &ccfe) {
-			return err
-		}
+		return c.locker.Release(ctx, c.cfg.ShardID, c.cfg.OwnerID)
 	}
 
 	return nil
@@ -385,77 +386,16 @@ func (c *Coordinator) loop(ctx context.Context) {
 // tryAcquire attempts to claim leadership for the shard.
 // It returns true if successful, false otherwise.
 func (c *Coordinator) tryAcquire(ctx context.Context) bool {
-	ttl := time.Now().Add(c.cfg.LeaseDuration).Unix()
-	_, err := c.db.PutItem(ctx, &dynamodb.PutItemInput{
-		TableName: &c.cfg.Table,
-		Item: map[string]types.AttributeValue{
-			"pk":      &types.AttributeValueMemberS{Value: "SHARD#" + c.cfg.ShardID},
-			"sk":      &types.AttributeValueMemberS{Value: "LOCK"},
-			"ownerId": &types.AttributeValueMemberS{Value: c.cfg.OwnerID},
-			"ttl":     &types.AttributeValueMemberN{Value: fmt.Sprint(ttl)},
-		},
-		// Since 'ttl' is a reserved keyword, we need to use ExpressionAttributeNames
-		// to reference it indirectly as #t
-		ConditionExpression: aws.String("attribute_not_exists(pk) OR (attribute_exists(pk) AND #t < :now)"),
-		ExpressionAttributeNames: map[string]string{
-			"#t": "ttl",
-		},
-		ExpressionAttributeValues: map[string]types.AttributeValue{
-			":now": &types.AttributeValueMemberN{Value: fmt.Sprint(time.Now().Unix())},
-		},
-	})
-
-	// Properly handle conditional check failures using AWS SDK error types
-	var ccfe *types.ConditionalCheckFailedException
-	if errors.As(err, &ccfe) {
-		// This is normal in leader election - silently return false
-		return false
-	} else if err != nil {
-		return false
-	}
-
-	return true
+	ttl := time.Now().Add(c.cfg.LeaseDuration)
+	success, err := c.locker.TryAcquire(ctx, c.cfg.ShardID, c.cfg.OwnerID, ttl)
+	return err == nil && success
 }
 
 // renew attempts to extend the leadership lease.
 // It returns true if renewal was successful, false if the lease could not be renewed
 // (e.g., because ownership was taken by another coordinator).
 func (c *Coordinator) renew(ctx context.Context) bool {
-	ttl := time.Now().Add(c.cfg.LeaseDuration).Unix()
-	_, err := c.db.UpdateItem(ctx, &dynamodb.UpdateItemInput{
-		TableName:           &c.cfg.Table,
-		Key:                 c.key(),
-		UpdateExpression:    aws.String("SET #t = :n"),
-		ConditionExpression: aws.String("ownerId = :me AND #t > :now"),
-		ExpressionAttributeNames: map[string]string{
-			"#t": "ttl",
-		},
-		ExpressionAttributeValues: map[string]types.AttributeValue{
-			":n":   &types.AttributeValueMemberN{Value: fmt.Sprint(ttl)},
-			":me":  &types.AttributeValueMemberS{Value: c.cfg.OwnerID},
-			":now": &types.AttributeValueMemberN{Value: fmt.Sprint(time.Now().Unix())},
-		},
-		ReturnValues: types.ReturnValueNone,
-	})
-
-	// Properly handle conditional check failures using AWS SDK error types
-	var ccfe *types.ConditionalCheckFailedException
-	if errors.As(err, &ccfe) {
-		// This is expected when another node took leadership or our lease expired
-		// Don't log this as it's normal operation
-		return false
-	} else if err != nil {
-		return false
-	}
-
-	// Don't log successful renewals at all to reduce noise
-	return true
-}
-
-// key returns the DynamoDB primary key components for the shard lock.
-func (c *Coordinator) key() map[string]types.AttributeValue {
-	return map[string]types.AttributeValue{
-		"pk": &types.AttributeValueMemberS{Value: "SHARD#" + c.cfg.ShardID},
-		"sk": &types.AttributeValueMemberS{Value: "LOCK"},
-	}
+	ttl := time.Now().Add(c.cfg.LeaseDuration)
+	success, err := c.locker.Renew(ctx, c.cfg.ShardID, c.cfg.OwnerID, ttl)
+	return err == nil && success
 }
