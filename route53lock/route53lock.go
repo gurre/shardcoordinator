@@ -116,7 +116,7 @@ func New(cfg Config) (*Route53Lock, error) {
 		return nil, errors.New("DomainName is required")
 	}
 	if cfg.Client == nil {
-		return nil, errors.New("Client is required")
+		return nil, errors.New("client is required")
 	}
 	return &Route53Lock{
 		hostedZoneID: cfg.HostedZoneID,

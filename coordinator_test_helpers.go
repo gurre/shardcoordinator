@@ -37,10 +37,10 @@ func (t *TrackingLocker) Release(ctx context.Context, shardID, ownerID string) e
 
 // DelayedLocker wraps a Locker with artificial delays to simulate slow backends.
 type DelayedLocker struct {
-	underlying    Locker
-	acquireDelay  time.Duration
-	renewDelay    time.Duration
-	releaseDelay  time.Duration
+	underlying   Locker
+	acquireDelay time.Duration
+	renewDelay   time.Duration
+	releaseDelay time.Duration
 }
 
 func (d *DelayedLocker) TryAcquire(ctx context.Context, shardID, ownerID string, ttl time.Time) (bool, error) {
@@ -67,8 +67,8 @@ func (d *DelayedLocker) Release(ctx context.Context, shardID, ownerID string) er
 // FlakyLocker randomly fails operations for chaos testing.
 // It wraps an underlying locker and randomly returns errors based on failureRate.
 type FlakyLocker struct {
-	underlying    Locker
-	failureRate   float64 // 0.0 to 1.0 probability of failure
+	underlying  Locker
+	failureRate float64 // 0.0 to 1.0 probability of failure
 }
 
 func (f *FlakyLocker) TryAcquire(ctx context.Context, shardID, ownerID string, ttl time.Time) (bool, error) {

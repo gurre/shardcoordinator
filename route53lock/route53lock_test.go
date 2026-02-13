@@ -869,10 +869,10 @@ func TestParseRecordValue_EdgeCases(t *testing.T) {
 // TestErrorDetection validates error classification functions
 func TestErrorDetection(t *testing.T) {
 	tests := []struct {
-		name              string
-		err               error
-		expectThrottling  bool
-		expectRetryable   bool
+		name               string
+		err                error
+		expectThrottling   bool
+		expectRetryable    bool
 		expectInvalidBatch bool
 	}{
 		{

@@ -110,7 +110,7 @@ func TestDynamoLock_Renew(t *testing.T) {
 				locker, _ := New(Config{Table: "test-table", Client: mock})
 				ctx := context.Background()
 				ttl := time.Now().Add(30 * time.Second)
-				locker.TryAcquire(ctx, "test-shard", "test-owner", ttl)
+				_, _ = locker.TryAcquire(ctx, "test-shard", "test-owner", ttl)
 			},
 			expectRenewed: true,
 			expectError:   false,
@@ -130,7 +130,7 @@ func TestDynamoLock_Renew(t *testing.T) {
 				locker, _ := New(Config{Table: "test-table", Client: mock})
 				ctx := context.Background()
 				ttl := time.Now().Add(30 * time.Second)
-				locker.TryAcquire(ctx, "test-shard", "test-owner", ttl)
+				_, _ = locker.TryAcquire(ctx, "test-shard", "test-owner", ttl)
 				// Then set error
 				mock.updateError = errors.New("dynamodb error")
 			},
@@ -174,7 +174,7 @@ func TestDynamoLock_Release(t *testing.T) {
 				locker, _ := New(Config{Table: "test-table", Client: mock})
 				ctx := context.Background()
 				ttl := time.Now().Add(30 * time.Second)
-				locker.TryAcquire(ctx, "test-shard", "test-owner", ttl)
+				_, _ = locker.TryAcquire(ctx, "test-shard", "test-owner", ttl)
 			},
 			expectError: false,
 		},
@@ -185,7 +185,7 @@ func TestDynamoLock_Release(t *testing.T) {
 				locker, _ := New(Config{Table: "test-table", Client: mock})
 				ctx := context.Background()
 				ttl := time.Now().Add(30 * time.Second)
-				locker.TryAcquire(ctx, "test-shard", "other-owner", ttl)
+				_, _ = locker.TryAcquire(ctx, "test-shard", "other-owner", ttl)
 			},
 			expectError: false,
 		},
@@ -196,7 +196,7 @@ func TestDynamoLock_Release(t *testing.T) {
 				locker, _ := New(Config{Table: "test-table", Client: mock})
 				ctx := context.Background()
 				ttl := time.Now().Add(30 * time.Second)
-				locker.TryAcquire(ctx, "test-shard", "test-owner", ttl)
+				_, _ = locker.TryAcquire(ctx, "test-shard", "test-owner", ttl)
 				// Then set error
 				mock.deleteError = errors.New("dynamodb error")
 			},
@@ -300,10 +300,10 @@ func TestKeyConstruction(t *testing.T) {
 	}
 
 	tests := []struct {
-		name        string
-		shardID     string
-		expectedPK  string
-		expectedSK  string
+		name       string
+		shardID    string
+		expectedPK string
+		expectedSK string
 	}{
 		{
 			name:       "standard shard ID",
@@ -468,10 +468,10 @@ func TestShardIDOwnerID_SpecialCharacters(t *testing.T) {
 // TestErrorDetection_DynamoDB validates error classification functions
 func TestErrorDetection_DynamoDB(t *testing.T) {
 	tests := []struct {
-		name                      string
-		err                       error
-		expectThrottling          bool
-		expectRetryable           bool
+		name                       string
+		err                        error
+		expectThrottling           bool
+		expectRetryable            bool
 		expectConditionalCheckFail bool
 	}{
 		{

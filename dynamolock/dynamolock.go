@@ -95,10 +95,10 @@ type DynamoLock struct {
 // It validates the configuration and returns an error if any required fields are missing.
 func New(cfg Config) (*DynamoLock, error) {
 	if cfg.Table == "" {
-		return nil, errors.New("Table is required")
+		return nil, errors.New("table is required")
 	}
 	if cfg.Client == nil {
-		return nil, errors.New("Client is required")
+		return nil, errors.New("client is required")
 	}
 	return &DynamoLock{
 		table:  cfg.Table,

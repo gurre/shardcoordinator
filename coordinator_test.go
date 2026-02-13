@@ -289,7 +289,7 @@ func TestEndToEnd_MultipleCoordinators(t *testing.T) {
 	// Ensure all coordinators are stopped at test end
 	defer func() {
 		for i := range coords {
-			coords[i].coord.Stop(context.Background())
+			_ = coords[i].coord.Stop(context.Background())
 		}
 		time.Sleep(100 * time.Millisecond) // Give goroutines time to exit
 	}()
@@ -328,24 +328,14 @@ func TestEndToEnd_MultipleCoordinators(t *testing.T) {
 
 	// Wait for initial leader election (with polling to detect early success)
 	// Use a longer timeout since coordinator startup and first acquisition can take time
-	var initialLeader string
-	timeout := time.After(5 * time.Second)
-	checkTicker := time.NewTicker(50 * time.Millisecond)
-	defer checkTicker.Stop()
-
-	for initialLeader == "" {
-		select {
-		case <-timeout:
-			// Debug info if we fail
-			t.Logf("Failed to get leader. Checking coordinator states...")
-			for i, info := range coords {
-				t.Logf("  Coordinator %d (owner: %s): active=%v, isLeader=%v",
-					i, info.ownerID, info.active, info.coord.IsLeader())
-			}
-			t.Fatalf("No coordinator became leader after startup")
-		case <-checkTicker.C:
-			initialLeader = getCurrentLeader()
+	initialLeader := waitForLeaderElection(t, getCurrentLeader, 5*time.Second)
+	if initialLeader == "" {
+		t.Logf("Failed to get leader. Checking coordinator states...")
+		for i, info := range coords {
+			t.Logf("  Coordinator %d (owner: %s): active=%v, isLeader=%v",
+				i, info.ownerID, info.active, info.coord.IsLeader())
 		}
+		t.Fatalf("No coordinator became leader after startup")
 	}
 
 	// Find the initial leader's index
@@ -376,23 +366,14 @@ func TestEndToEnd_MultipleCoordinators(t *testing.T) {
 	}
 
 	// Wait for new leader election (with polling, longer timeout for reliability)
-	var newLeader string
-	newLeaderTimeout := time.After(5 * time.Second)
-	newLeaderTicker := time.NewTicker(50 * time.Millisecond)
-	defer newLeaderTicker.Stop()
-
-	for newLeader == "" {
-		select {
-		case <-newLeaderTimeout:
-			t.Logf("Failed to get new leader. Checking coordinator states...")
-			for i, info := range coords {
-				t.Logf("  Coordinator %d (owner: %s): active=%v, isLeader=%v",
-					i, info.ownerID, info.active, info.coord.IsLeader())
-			}
-			t.Fatalf("No new leader elected after stopping initial leader")
-		case <-newLeaderTicker.C:
-			newLeader = getCurrentLeader()
+	newLeader := waitForLeaderElection(t, getCurrentLeader, 5*time.Second)
+	if newLeader == "" {
+		t.Logf("Failed to get new leader. Checking coordinator states...")
+		for i, info := range coords {
+			t.Logf("  Coordinator %d (owner: %s): active=%v, isLeader=%v",
+				i, info.ownerID, info.active, info.coord.IsLeader())
 		}
+		t.Fatalf("No new leader elected after stopping initial leader")
 	}
 
 	// Verify new leader is different from stopped leader
@@ -437,6 +418,24 @@ func TestEndToEnd_MultipleCoordinators(t *testing.T) {
 	if len(leaderHistory) < 2 {
 		t.Fatalf("Expected at least 2 leadership transitions, got %d", len(leaderHistory))
 	}
+}
+
+// waitForLeaderElection polls getCurrentLeader until a leader is elected or timeout occurs.
+func waitForLeaderElection(t *testing.T, getCurrentLeader func() string, timeout time.Duration) string {
+	var leader string
+	timeoutCh := time.After(timeout)
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+
+	for leader == "" {
+		select {
+		case <-timeoutCh:
+			return ""
+		case <-ticker.C:
+			leader = getCurrentLeader()
+		}
+	}
+	return leader
 }
 
 // TestOwnerIDValidation tests that invalid OwnerIDs are rejected during coordinator creation

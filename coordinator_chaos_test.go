@@ -53,7 +53,7 @@ func TestCoordinator_DoubleStart_GoroutineLeak(t *testing.T) {
 		initialGoroutines, goroutinesAfterFirst, goroutinesAfterSecond)
 
 	// Cleanup
-	coord.Stop(ctx)
+	_ = coord.Stop(ctx)
 }
 
 // TestCoordinator_DuplicateOwnerID_SplitBrain tests the documented failure mode (README line 517-522)
@@ -95,8 +95,8 @@ func TestCoordinator_DuplicateOwnerID_SplitBrain(t *testing.T) {
 	ctx := context.Background()
 
 	// Start both with duplicate ownerID
-	coord1.Start(ctx)
-	coord2.Start(ctx)
+	_ = coord1.Start(ctx)
+	_ = coord2.Start(ctx)
 
 	// Wait for acquisition attempts
 	time.Sleep(2 * time.Second)
@@ -117,8 +117,8 @@ func TestCoordinator_DuplicateOwnerID_SplitBrain(t *testing.T) {
 	// This is a documented limitation, not a bug
 	// The test serves as executable documentation of the expected behavior
 
-	coord1.Stop(ctx)
-	coord2.Stop(ctx)
+	_ = coord1.Stop(ctx)
+	_ = coord2.Stop(ctx)
 }
 
 // TestCoordinator_ZombieLeader_AfterPanic tests the documented failure mode (README line 373-380)
@@ -144,7 +144,7 @@ func TestCoordinator_ZombieLeader_AfterPanic(t *testing.T) {
 
 	// Use cancellable context to simulate process crash
 	ctx, cancel := context.WithCancel(context.Background())
-	coord1.Start(ctx)
+	_ = coord1.Start(ctx)
 
 	// Wait for acquisition
 	acquired := waitForLeadership(t, coord1, 5*time.Second)
@@ -179,7 +179,7 @@ func TestCoordinator_ZombieLeader_AfterPanic(t *testing.T) {
 
 	// Measure time until coord2 becomes leader
 	start := time.Now()
-	coord2.Start(context.Background())
+	_ = coord2.Start(context.Background())
 
 	acquired2 := waitForLeadership(t, coord2, 10*time.Second)
 	elapsed := time.Since(start)
@@ -200,7 +200,7 @@ func TestCoordinator_ZombieLeader_AfterPanic(t *testing.T) {
 		t.Logf("Zombie lock recovered after %v (lease duration: %v)", elapsed, leaseDuration)
 	}
 
-	coord2.Stop(context.Background())
+	_ = coord2.Stop(context.Background())
 }
 
 // TestCoordinator_ContextCancel_WithoutStop tests the documented failure mode (README line 481-490)
@@ -227,7 +227,7 @@ func TestCoordinator_ContextCancel_WithoutStop(t *testing.T) {
 	// Create cancellable context
 	ctx, cancel := context.WithCancel(context.Background())
 
-	coord.Start(ctx)
+	_ = coord.Start(ctx)
 
 	// Wait for acquisition
 	acquired := waitForLeadership(t, coord, 5*time.Second)
@@ -262,7 +262,7 @@ func TestCoordinator_ContextCancel_WithoutStop(t *testing.T) {
 		stateMu: sync.RWMutex{},
 	}
 
-	coord2.Start(context.Background())
+	_ = coord2.Start(context.Background())
 
 	// New coordinator CANNOT acquire immediately
 	time.Sleep(1 * time.Second)
@@ -280,7 +280,7 @@ func TestCoordinator_ContextCancel_WithoutStop(t *testing.T) {
 
 	t.Log("Verified: Lock remained held after context cancellation until TTL expired")
 
-	coord2.Stop(context.Background())
+	_ = coord2.Stop(context.Background())
 }
 
 // TestCoordinator_ThunderingHerd_Jitter tests that acquisition attempts are spread out
@@ -330,7 +330,7 @@ func TestCoordinator_ThunderingHerd_Jitter(t *testing.T) {
 	// Start all coordinators at the same time
 	startTime := time.Now()
 	for i := range coordinators {
-		coordinators[i].Start(ctx)
+		_ = coordinators[i].Start(ctx)
 	}
 
 	// Wait for attempts to accumulate
@@ -338,7 +338,7 @@ func TestCoordinator_ThunderingHerd_Jitter(t *testing.T) {
 
 	// Stop all coordinators
 	for _, coord := range coordinators {
-		coord.Stop(ctx)
+		_ = coord.Stop(ctx)
 	}
 
 	// Analyze attempt distribution
@@ -393,8 +393,8 @@ func TestCoordinator_SlowBackend_InterTickExpiry(t *testing.T) {
 
 	// Wrap locker with artificial delay
 	slowLocker := &DelayedLocker{
-		underlying:  locker,
-		renewDelay:  3 * time.Second, // Longer than renewPeriod but less than leaseDuration
+		underlying: locker,
+		renewDelay: 3 * time.Second, // Longer than renewPeriod but less than leaseDuration
 	}
 
 	coord := &Coordinator{
@@ -411,7 +411,7 @@ func TestCoordinator_SlowBackend_InterTickExpiry(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	coord.Start(ctx)
+	_ = coord.Start(ctx)
 
 	// Wait for acquisition
 	acquired := waitForLeadership(t, coord, 5*time.Second)
@@ -437,7 +437,7 @@ func TestCoordinator_SlowBackend_InterTickExpiry(t *testing.T) {
 	// Actual behavior depends on race between renewal completion and expiry
 	t.Log("Verified: Slow backend can cause timing issues with renewals")
 
-	coord.Stop(ctx)
+	_ = coord.Stop(ctx)
 }
 
 // TestCoordinator_StopTOCTOU_Race tests the documented TOCTOU race (README line 491-497)
@@ -462,7 +462,7 @@ func TestCoordinator_StopTOCTOU_Race(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	coord1.Start(ctx)
+	_ = coord1.Start(ctx)
 
 	// Wait for acquisition
 	acquired := waitForLeadership(t, coord1, 5*time.Second)
@@ -483,7 +483,7 @@ func TestCoordinator_StopTOCTOU_Race(t *testing.T) {
 		state:   follower,
 		stateMu: sync.RWMutex{},
 	}
-	coord2.Start(ctx)
+	_ = coord2.Start(ctx)
 
 	// Call Stop() on coord1 while coord2 is attempting to acquire
 	// This creates potential for TOCTOU race
@@ -503,7 +503,7 @@ func TestCoordinator_StopTOCTOU_Race(t *testing.T) {
 		t.Log("coord2 hasn't acquired yet, lock may be in transition")
 	}
 
-	coord2.Stop(ctx)
+	_ = coord2.Stop(ctx)
 }
 
 // TestCoordinator_MultipleFailureModes_Combined tests behavior when multiple
@@ -536,7 +536,7 @@ func TestCoordinator_MultipleFailureModes_Combined(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	coord.Start(ctx)
+	_ = coord.Start(ctx)
 
 	// Monitor leadership over time
 	leadershipChanges := 0
@@ -554,5 +554,5 @@ func TestCoordinator_MultipleFailureModes_Combined(t *testing.T) {
 	t.Logf("Leadership changes observed: %d", leadershipChanges)
 	t.Log("Coordinator survived combined failure modes (slow + flaky backend)")
 
-	coord.Stop(context.Background())
+	_ = coord.Stop(context.Background())
 }
