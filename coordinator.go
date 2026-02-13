@@ -101,6 +101,9 @@ package shardcoordinator
 import (
 	"context"
 	"errors"
+	"fmt"
+	"math/rand"
+	"strings"
 	"sync"
 	"time"
 )
@@ -211,6 +214,22 @@ const (
 	leader               // The coordinator is the active leader for the shard
 )
 
+// validateOwnerID checks if an ownerID is valid for use in lock records.
+// Returns an error if the ownerID contains problematic characters that would
+// break the record parsing (spaces, tabs, newlines, quotes) or if it's too long.
+func validateOwnerID(ownerID string) error {
+	if ownerID == "" {
+		return errors.New("ownerID cannot be empty")
+	}
+	if strings.ContainsAny(ownerID, " \t\n\r\"") {
+		return errors.New("ownerID cannot contain spaces, tabs, newlines, or quotes")
+	}
+	if len(ownerID) > 200 {
+		return errors.New("ownerID too long (max 200 characters)")
+	}
+	return nil
+}
+
 // New creates a new Coordinator with the provided configuration.
 // It validates the configuration and returns an error if any required fields are missing
 // or if the renew period is too long relative to the lease duration.
@@ -243,9 +262,28 @@ func New(cfg Config) (*Coordinator, error) {
 	if cfg.Locker == nil {
 		return nil, errors.New("Locker is required")
 	}
+
+	// Validate OwnerID format
+	if err := validateOwnerID(cfg.OwnerID); err != nil {
+		return nil, fmt.Errorf("invalid ownerID: %w", err)
+	}
+
+	// Validate ShardID for DNS safety and parsing safety
+	if strings.ContainsAny(cfg.ShardID, " \t\n\r\"") {
+		return nil, errors.New("shardID cannot contain spaces, tabs, newlines, or quotes")
+	}
+
+	// Validate timing configuration
+	if cfg.LeaseDuration <= 0 {
+		return nil, errors.New("LeaseDuration must be positive")
+	}
+	if cfg.RenewPeriod <= 0 {
+		return nil, errors.New("RenewPeriod must be positive")
+	}
 	if cfg.RenewPeriod >= cfg.LeaseDuration {
 		return nil, errors.New("RenewPeriod must be < LeaseDuration")
 	}
+
 	return &Coordinator{
 		cfg:    cfg,
 		locker: cfg.Locker,
@@ -287,6 +325,8 @@ func (c *Coordinator) IsFollower() bool {
 // and maintaining it if successful. It runs a background goroutine that handles the
 // leader election loop.
 //
+// Returns an error if Start() has already been called on this coordinator.
+//
 // Example:
 //
 //	ctx := context.Background()
@@ -297,8 +337,18 @@ func (c *Coordinator) IsFollower() bool {
 //
 //	// The coordinator is now running and will attempt to acquire leadership
 func (c *Coordinator) Start(ctx context.Context) error {
-	ctx, c.stop = context.WithCancel(ctx)
-	go c.loop(ctx)
+	c.stateMu.Lock()
+	defer c.stateMu.Unlock()
+
+	// Check if already started to prevent goroutine leak
+	if c.stop != nil {
+		return errors.New("coordinator already started")
+	}
+
+	loopCtx, cancel := context.WithCancel(ctx)
+	c.stop = cancel
+
+	go c.loop(loopCtx)
 	return nil
 }
 
@@ -345,8 +395,12 @@ func (c *Coordinator) loop(ctx context.Context) {
 	renewTicker := time.NewTicker(c.cfg.RenewPeriod)
 	defer renewTicker.Stop()
 
-	// Use a shorter acquisition attempt interval when in follower state
-	acquireTicker := time.NewTicker(c.cfg.RenewPeriod / 2)
+	// Use a shorter acquisition attempt interval when in follower state with jitter
+	// to desynchronize coordinators and prevent thundering herd
+	baseInterval := c.cfg.RenewPeriod / 2
+	jitterRange := baseInterval / 4
+	jitter := time.Duration(rand.Int63n(int64(jitterRange)))
+	acquireTicker := time.NewTicker(baseInterval + jitter)
 	defer acquireTicker.Stop()
 
 	for {

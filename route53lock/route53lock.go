@@ -1,10 +1,25 @@
 // Package route53lock provides a Route53 DNS-based implementation of distributed locking.
+//
+// # Rate Limits
+//
+// Route53 enforces 5 ChangeResourceRecordSets calls/second per hosted zone.
+// Safe shard count: MaxShards = 5 × RenewPeriod × 0.5
+// Example: 10s renewal → max 25 shards
+//
+// Exceeding rate limits causes throttling. This implementation includes
+// automatic retry with exponential backoff.
+//
+// # Record Format
+//
+// Lock records are TXT records with format: "{ownerID} {epochUnix}"
+// OwnerID must not contain spaces, tabs, or quotes.
 package route53lock
 
 import (
 	"context"
 	"errors"
 	"fmt"
+	"math/rand"
 	"strconv"
 	"strings"
 	"time"
@@ -19,6 +34,57 @@ import (
 type Route53Client interface {
 	ChangeResourceRecordSets(ctx context.Context, params *route53.ChangeResourceRecordSetsInput, optFns ...func(*route53.Options)) (*route53.ChangeResourceRecordSetsOutput, error)
 	ListResourceRecordSets(ctx context.Context, params *route53.ListResourceRecordSetsInput, optFns ...func(*route53.Options)) (*route53.ListResourceRecordSetsOutput, error)
+}
+
+// retryWithBackoff executes a function with exponential backoff on retryable errors.
+// It retries up to maxRetries times with exponential backoff and jitter.
+// Returns the last error if all retries are exhausted.
+func retryWithBackoff(ctx context.Context, maxRetries int, fn func() error, isRetryable func(error) bool) error {
+	var lastErr error
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		lastErr = fn()
+		if lastErr == nil {
+			return nil
+		}
+		if !isRetryable(lastErr) {
+			return lastErr
+		}
+		if attempt < maxRetries-1 {
+			backoff := time.Duration(1<<attempt) * 100 * time.Millisecond
+			jitter := time.Duration(rand.Int63n(int64(backoff / 2)))
+			select {
+			case <-time.After(backoff + jitter):
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+	}
+	return lastErr
+}
+
+// isThrottlingError checks if an error is a Route53 throttling error.
+func isThrottlingError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var te *types.ThrottlingException
+	return errors.As(err, &te)
+}
+
+// isRetryableError checks if an error should be retried.
+func isRetryableError(err error) bool {
+	if err == nil {
+		return false
+	}
+	// Retry on throttling
+	if isThrottlingError(err) {
+		return true
+	}
+	// Retry on transient network errors
+	errStr := err.Error()
+	return strings.Contains(errStr, "RequestTimeout") ||
+		strings.Contains(errStr, "ServiceUnavailable") ||
+		strings.Contains(errStr, "InternalError")
 }
 
 // Config carries the configuration for Route53-based locking.
@@ -112,20 +178,30 @@ func (r *Route53Lock) TryAcquire(ctx context.Context, shardID string, ownerID st
 		},
 	})
 
-	// Execute atomic batch
-	_, err = r.client.ChangeResourceRecordSets(ctx, &route53.ChangeResourceRecordSetsInput{
-		HostedZoneId: aws.String(r.hostedZoneID),
-		ChangeBatch: &types.ChangeBatch{
-			Changes: changes,
-		},
+	// Execute atomic batch with retry on throttling
+	var changeErr error
+	retryErr := retryWithBackoff(ctx, 4, func() error {
+		_, changeErr = r.client.ChangeResourceRecordSets(ctx, &route53.ChangeResourceRecordSetsInput{
+			HostedZoneId: aws.String(r.hostedZoneID),
+			ChangeBatch: &types.ChangeBatch{
+				Changes: changes,
+			},
+		})
+		return changeErr
+	}, func(err error) bool {
+		// Don't retry InvalidChangeBatch (application-level lock contention)
+		if isInvalidChangeBatchError(err) {
+			return false
+		}
+		return isRetryableError(err)
 	})
 
-	if err != nil {
+	if retryErr != nil {
 		// Check if it's a conflict (another coordinator won the race)
-		if isInvalidChangeBatchError(err) {
+		if isInvalidChangeBatchError(changeErr) {
 			return false, nil
 		}
-		return false, err
+		return false, retryErr
 	}
 
 	return true, nil
@@ -164,41 +240,51 @@ func (r *Route53Lock) Renew(ctx context.Context, shardID string, ownerID string,
 		return false, nil
 	}
 
-	// Build atomic batch: DELETE old + CREATE new with updated TTL
-	_, err = r.client.ChangeResourceRecordSets(ctx, &route53.ChangeResourceRecordSetsInput{
-		HostedZoneId: aws.String(r.hostedZoneID),
-		ChangeBatch: &types.ChangeBatch{
-			Changes: []types.Change{
-				{
-					Action: types.ChangeActionDelete,
-					ResourceRecordSet: &types.ResourceRecordSet{
-						Name:            aws.String(recordName),
-						Type:            types.RRTypeTxt,
-						TTL:             aws.Int64(60),
-						ResourceRecords: existing.ResourceRecords,
+	// Build atomic batch: DELETE old + CREATE new with updated TTL (with retry on throttling)
+	var changeErr error
+	retryErr := retryWithBackoff(ctx, 4, func() error {
+		_, changeErr = r.client.ChangeResourceRecordSets(ctx, &route53.ChangeResourceRecordSetsInput{
+			HostedZoneId: aws.String(r.hostedZoneID),
+			ChangeBatch: &types.ChangeBatch{
+				Changes: []types.Change{
+					{
+						Action: types.ChangeActionDelete,
+						ResourceRecordSet: &types.ResourceRecordSet{
+							Name:            aws.String(recordName),
+							Type:            types.RRTypeTxt,
+							TTL:             aws.Int64(60),
+							ResourceRecords: existing.ResourceRecords,
+						},
 					},
-				},
-				{
-					Action: types.ChangeActionCreate,
-					ResourceRecordSet: &types.ResourceRecordSet{
-						Name: aws.String(recordName),
-						Type: types.RRTypeTxt,
-						TTL:  aws.Int64(60),
-						ResourceRecords: []types.ResourceRecord{
-							{Value: aws.String(newValue)},
+					{
+						Action: types.ChangeActionCreate,
+						ResourceRecordSet: &types.ResourceRecordSet{
+							Name: aws.String(recordName),
+							Type: types.RRTypeTxt,
+							TTL:  aws.Int64(60),
+							ResourceRecords: []types.ResourceRecord{
+								{Value: aws.String(newValue)},
+							},
 						},
 					},
 				},
 			},
-		},
+		})
+		return changeErr
+	}, func(err error) bool {
+		// Don't retry InvalidChangeBatch (application-level lock contention)
+		if isInvalidChangeBatchError(err) {
+			return false
+		}
+		return isRetryableError(err)
 	})
 
-	if err != nil {
+	if retryErr != nil {
 		// Check if it's a conflict (record changed between read and write)
-		if isInvalidChangeBatchError(err) {
+		if isInvalidChangeBatchError(changeErr) {
 			return false, nil
 		}
-		return false, err
+		return false, retryErr
 	}
 
 	return true, nil
@@ -231,30 +317,40 @@ func (r *Route53Lock) Release(ctx context.Context, shardID string, ownerID strin
 		return nil
 	}
 
-	// Delete the record
-	_, err = r.client.ChangeResourceRecordSets(ctx, &route53.ChangeResourceRecordSetsInput{
-		HostedZoneId: aws.String(r.hostedZoneID),
-		ChangeBatch: &types.ChangeBatch{
-			Changes: []types.Change{
-				{
-					Action: types.ChangeActionDelete,
-					ResourceRecordSet: &types.ResourceRecordSet{
-						Name:            aws.String(recordName),
-						Type:            types.RRTypeTxt,
-						TTL:             aws.Int64(60),
-						ResourceRecords: existing.ResourceRecords,
+	// Delete the record with retry on throttling
+	var changeErr error
+	retryErr := retryWithBackoff(ctx, 4, func() error {
+		_, changeErr = r.client.ChangeResourceRecordSets(ctx, &route53.ChangeResourceRecordSetsInput{
+			HostedZoneId: aws.String(r.hostedZoneID),
+			ChangeBatch: &types.ChangeBatch{
+				Changes: []types.Change{
+					{
+						Action: types.ChangeActionDelete,
+						ResourceRecordSet: &types.ResourceRecordSet{
+							Name:            aws.String(recordName),
+							Type:            types.RRTypeTxt,
+							TTL:             aws.Int64(60),
+							ResourceRecords: existing.ResourceRecords,
+						},
 					},
 				},
 			},
-		},
+		})
+		return changeErr
+	}, func(err error) bool {
+		// Don't retry InvalidChangeBatch (application-level lock contention)
+		if isInvalidChangeBatchError(err) {
+			return false
+		}
+		return isRetryableError(err)
 	})
 
-	if err != nil {
+	if retryErr != nil {
 		// Ignore conflicts (record changed, ownership changed)
-		if isInvalidChangeBatchError(err) {
+		if isInvalidChangeBatchError(changeErr) {
 			return nil
 		}
-		return err
+		return retryErr
 	}
 
 	return nil

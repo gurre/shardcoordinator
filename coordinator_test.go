@@ -438,3 +438,294 @@ func TestEndToEnd_MultipleCoordinators(t *testing.T) {
 		t.Fatalf("Expected at least 2 leadership transitions, got %d", len(leaderHistory))
 	}
 }
+
+// TestOwnerIDValidation tests that invalid OwnerIDs are rejected during coordinator creation
+func TestOwnerIDValidation(t *testing.T) {
+	mockLocker := createTestLocker(t)
+
+	tests := []struct {
+		name    string
+		ownerID string
+		valid   bool
+	}{
+		{"valid alphanumeric", "valid-owner-123", true},
+		{"valid with dashes", "my-worker-abc-def", true},
+		{"valid with underscores", "worker_123_456", true},
+		{"valid with single quote", "owner'with'quote", true},
+		{"invalid with space", "owner with space", false},
+		{"invalid with tab", "owner\twith\ttab", false},
+		{"invalid with newline", "owner\nwith\nnewline", false},
+		{"invalid with carriage return", "owner\rwith\rCR", false},
+		{"invalid with double quote", "owner\"with\"quote", false},
+		{"empty string", "", false},
+		{"too long", string(make([]byte, 201)), false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := New(Config{
+				ShardID:       "test-shard",
+				OwnerID:       tt.ownerID,
+				LeaseDuration: 30 * time.Second,
+				RenewPeriod:   10 * time.Second,
+				Locker:        mockLocker,
+			})
+
+			if tt.valid && err != nil {
+				t.Errorf("Expected valid ownerID %q to pass, got error: %v", tt.ownerID, err)
+			}
+			if !tt.valid && err == nil {
+				t.Errorf("Expected invalid ownerID %q to fail, but no error was returned", tt.ownerID)
+			}
+		})
+	}
+}
+
+// TestShardIDValidation tests that invalid ShardIDs are rejected during coordinator creation
+func TestShardIDValidation(t *testing.T) {
+	mockLocker := createTestLocker(t)
+
+	tests := []struct {
+		name    string
+		shardID string
+		valid   bool
+	}{
+		{"valid alphanumeric", "valid-shard-123", true},
+		{"valid with dashes", "my-shard-abc-def", true},
+		{"invalid with space", "shard with space", false},
+		{"invalid with tab", "shard\twith\ttab", false},
+		{"invalid with newline", "shard\nwith\nnewline", false},
+		{"invalid with quote", "shard\"with\"quote", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := New(Config{
+				ShardID:       tt.shardID,
+				OwnerID:       "valid-owner",
+				LeaseDuration: 30 * time.Second,
+				RenewPeriod:   10 * time.Second,
+				Locker:        mockLocker,
+			})
+
+			if tt.valid && err != nil {
+				t.Errorf("Expected valid shardID %q to pass, got error: %v", tt.shardID, err)
+			}
+			if !tt.valid && err == nil {
+				t.Errorf("Expected invalid shardID %q to fail, but no error was returned", tt.shardID)
+			}
+		})
+	}
+}
+
+// TestTimingConfigurationValidation tests lease duration and renew period validation
+func TestTimingConfigurationValidation(t *testing.T) {
+	mockLocker := createTestLocker(t)
+
+	tests := []struct {
+		name          string
+		leaseDuration time.Duration
+		renewPeriod   time.Duration
+		valid         bool
+		description   string
+	}{
+		{
+			name:          "valid 3:1 ratio",
+			leaseDuration: 15 * time.Second,
+			renewPeriod:   5 * time.Second,
+			valid:         true,
+			description:   "Recommended 3:1 ratio",
+		},
+		{
+			name:          "valid 4:1 ratio",
+			leaseDuration: 20 * time.Second,
+			renewPeriod:   5 * time.Second,
+			valid:         true,
+			description:   "Conservative 4:1 ratio",
+		},
+		{
+			name:          "valid 2:1 ratio",
+			leaseDuration: 10 * time.Second,
+			renewPeriod:   5 * time.Second,
+			valid:         true,
+			description:   "Aggressive 2:1 ratio",
+		},
+		{
+			name:          "invalid equal durations",
+			leaseDuration: 10 * time.Second,
+			renewPeriod:   10 * time.Second,
+			valid:         false,
+			description:   "RenewPeriod must be less than LeaseDuration",
+		},
+		{
+			name:          "invalid renew period longer",
+			leaseDuration: 5 * time.Second,
+			renewPeriod:   10 * time.Second,
+			valid:         false,
+			description:   "RenewPeriod cannot exceed LeaseDuration",
+		},
+		{
+			name:          "valid minimum durations",
+			leaseDuration: 2 * time.Second,
+			renewPeriod:   1 * time.Second,
+			valid:         true,
+			description:   "Very short durations but valid ratio",
+		},
+		{
+			name:          "valid long durations",
+			leaseDuration: 5 * time.Minute,
+			renewPeriod:   1 * time.Minute,
+			valid:         true,
+			description:   "Long durations for stable systems",
+		},
+		{
+			name:          "edge case renew period one less",
+			leaseDuration: 10 * time.Second,
+			renewPeriod:   10*time.Second - 1*time.Nanosecond,
+			valid:         true,
+			description:   "RenewPeriod just under LeaseDuration",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := New(Config{
+				ShardID:       "test-shard",
+				OwnerID:       "test-owner",
+				LeaseDuration: tt.leaseDuration,
+				RenewPeriod:   tt.renewPeriod,
+				Locker:        mockLocker,
+			})
+
+			if tt.valid && err != nil {
+				t.Errorf("%s: Expected valid config to pass, got error: %v", tt.description, err)
+			}
+			if !tt.valid && err == nil {
+				t.Errorf("%s: Expected invalid config to fail, but no error was returned", tt.description)
+			}
+		})
+	}
+}
+
+// TestConfigValidation_EdgeCases tests edge cases in coordinator configuration
+func TestConfigValidation_EdgeCases(t *testing.T) {
+	mockLocker := createTestLocker(t)
+
+	tests := []struct {
+		name        string
+		cfg         Config
+		wantErr     bool
+		description string
+	}{
+		{
+			name: "valid minimal config",
+			cfg: Config{
+				ShardID:       "s",
+				OwnerID:       "o",
+				LeaseDuration: 2 * time.Second,
+				RenewPeriod:   1 * time.Second,
+				Locker:        mockLocker,
+			},
+			wantErr:     false,
+			description: "Single character IDs should be valid",
+		},
+		{
+			name: "valid long IDs",
+			cfg: Config{
+				ShardID:       string(make([]byte, 199)),
+				OwnerID:       string(make([]byte, 199)),
+				LeaseDuration: 10 * time.Second,
+				RenewPeriod:   3 * time.Second,
+				Locker:        mockLocker,
+			},
+			wantErr:     false,
+			description: "Long but under limit IDs should be valid",
+		},
+		{
+			name: "invalid nil locker",
+			cfg: Config{
+				ShardID:       "shard",
+				OwnerID:       "owner",
+				LeaseDuration: 10 * time.Second,
+				RenewPeriod:   3 * time.Second,
+				Locker:        nil,
+			},
+			wantErr:     true,
+			description: "Nil locker should be rejected",
+		},
+		{
+			name: "invalid zero lease duration",
+			cfg: Config{
+				ShardID:       "shard",
+				OwnerID:       "owner",
+				LeaseDuration: 0,
+				RenewPeriod:   1 * time.Second,
+				Locker:        mockLocker,
+			},
+			wantErr:     true,
+			description: "Zero lease duration should be rejected",
+		},
+		{
+			name: "invalid zero renew period",
+			cfg: Config{
+				ShardID:       "shard",
+				OwnerID:       "owner",
+				LeaseDuration: 10 * time.Second,
+				RenewPeriod:   0,
+				Locker:        mockLocker,
+			},
+			wantErr:     true,
+			description: "Zero renew period should be rejected",
+		},
+		{
+			name: "invalid negative lease duration",
+			cfg: Config{
+				ShardID:       "shard",
+				OwnerID:       "owner",
+				LeaseDuration: -10 * time.Second,
+				RenewPeriod:   1 * time.Second,
+				Locker:        mockLocker,
+			},
+			wantErr:     true,
+			description: "Negative lease duration should be rejected",
+		},
+		{
+			name: "invalid negative renew period",
+			cfg: Config{
+				ShardID:       "shard",
+				OwnerID:       "owner",
+				LeaseDuration: 10 * time.Second,
+				RenewPeriod:   -1 * time.Second,
+				Locker:        mockLocker,
+			},
+			wantErr:     true,
+			description: "Negative renew period should be rejected",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// For long IDs, fill with 'a'
+			if len(tt.cfg.ShardID) > 1 {
+				shardBytes := make([]byte, len(tt.cfg.ShardID))
+				for i := range shardBytes {
+					shardBytes[i] = 'a'
+				}
+				tt.cfg.ShardID = string(shardBytes)
+			}
+			if len(tt.cfg.OwnerID) > 1 {
+				ownerBytes := make([]byte, len(tt.cfg.OwnerID))
+				for i := range ownerBytes {
+					ownerBytes[i] = 'b'
+				}
+				tt.cfg.OwnerID = string(ownerBytes)
+			}
+
+			_, err := New(tt.cfg)
+
+			if (err != nil) != tt.wantErr {
+				t.Errorf("%s: New() error = %v, wantErr %v", tt.description, err, tt.wantErr)
+			}
+		})
+	}
+}

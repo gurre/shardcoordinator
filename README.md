@@ -347,6 +347,79 @@ The relationship between `LeaseDuration` and `RenewPeriod` significantly impacts
 - Recommended ratio: `LeaseDuration` should be 3-4× `RenewPeriod`
 - System tolerates network delays up to: `LeaseDuration - RenewPeriod`
 
+### Scaling and Rate Limits
+
+#### Route53 Rate Limits
+
+AWS Route53 enforces a **5 ChangeResourceRecordSets calls per second** limit per hosted zone. Exceeding this limit causes throttling errors that can temporarily prevent leadership renewal. This implementation includes automatic retry with exponential backoff to handle transient throttling.
+
+#### Calculating Safe Shard Count
+
+**Steady State (leaders renewing)**:
+```
+API Calls/sec = NumShards / RenewPeriod
+```
+
+**Safe Configuration Formula**:
+```
+MaxShards = 5 calls/sec × RenewPeriod × SafetyFactor(0.5)
+```
+
+**Recommended Configurations**:
+
+| RenewPeriod | Max Shards | Notes |
+|-------------|------------|-------|
+| 5s          | 12         | Conservative for frequent elections |
+| 10s         | 25         | **Recommended for production** |
+| 15s         | 37         | For stable, low-churn environments |
+| 20s         | 50         | Maximum recommended |
+
+**During Leader Elections**:
+
+With N coordinators competing for a shard, API call rate can spike:
+```
+Peak Calls/sec = N coordinators × 2 attempts/RenewPeriod
+```
+
+**Recommendation**: Use **RenewPeriod ≥ 10s** for deployments with >10 coordinators per shard.
+
+#### DynamoDB Rate Limits
+
+DynamoDB has much higher default throughput (~40,000 RCU) but can still throttle under heavy load. This implementation includes automatic retry with exponential backoff. Consider using:
+- **Auto-scaling** for variable workloads
+- **On-demand billing** mode for unpredictable traffic patterns
+- **Provisioned capacity** for consistent, predictable loads
+
+#### Cost Estimation
+
+**Route53 Pricing** (as of 2024):
+- $0.50 per million queries
+- Steady state cost formula:
+  ```
+  Monthly Cost = (NumShards / RenewPeriod) × 86400 × 30 / 1000000 × $0.50
+  ```
+- Example: 25 shards with 10s renewal = ~$2.70/month
+
+**DynamoDB Pricing**:
+- **On-Demand**: $1.25 per million write requests
+- **Provisioned**: Variable based on WCU allocation
+- Steady state: 1 write per RenewPeriod per shard
+
+#### OwnerID and ShardID Format Requirements
+
+To ensure proper lock record parsing:
+- **OwnerID** must not contain spaces, tabs, newlines, or quotes
+- **ShardID** must not contain spaces, tabs, newlines, or quotes
+- Maximum length: 200 characters for OwnerID
+
+**Safe OwnerID Generation**:
+```go
+hostname, _ := os.Hostname()
+// Sanitize hostname
+hostname = strings.ReplaceAll(hostname, " ", "-")
+ownerID := fmt.Sprintf("%s-%d-%s", hostname, os.Getpid(), uuid.New().String())
+```
+
 ## How Atomic Operations Guarantee Single Leader
 
 ### DynamoDB Backend
@@ -416,7 +489,7 @@ This section catalogs known failure modes of the lock and leader election system
 | **Error-blind renewal** | Transient backend error (throttle, timeout) during `Renew()` | `renew()` returns false on any error, coordinator demotes to follower even though it may still hold the lease. Unnecessary leadership churn. | `coordinator.go:396-400` |
 | **Zombie leader after loop panic** | Nil pointer or panic inside `loop()` goroutine | `IsLeader()` returns last state forever. No renewals happen, lease expires, another node takes over, but this node still reports leader. | `coordinator.go:343-383` |
 | **Stop() skips Release() due to TOCTOU** | `loop()` acquires leadership between `Stop()`'s state read and context cancel | Lock held but never released. Stuck until TTL expiry. | `coordinator.go:315-336` |
-| **Double Start()** | Caller invokes `Start()` twice | Second call overwrites `c.stop`, leaking first goroutine. Two loops run, causing unpredictable state transitions. | `coordinator.go:298-302` |
+| ~~**Double Start()**~~ | ~~Caller invokes `Start()` twice~~ | ~~Second call overwrites `c.stop`, leaking first goroutine. Two loops run, causing unpredictable state transitions.~~ **FIXED**: `Start()` now returns error on second call, preventing goroutine leak. | `coordinator.go:337-353` |
 | **Stale leadership after parent context cancellation** | Parent context cancelled without calling `Stop()` | Loop exits, state stays `leader`, no release. `IsLeader()` returns true with expired lease. | `coordinator.go:352-353` |
 
 ### Clock & Timing
@@ -451,3 +524,47 @@ This section catalogs known failure modes of the lock and leader election system
 | **Stop() hangs on slow Release()** | Backend slow or partitioned during shutdown | `Stop()` blocks indefinitely — no internal timeout on `Release()`. | `coordinator.go:332` |
 | **Process crash without Stop()** | OOM kill, SIGKILL, power loss | No `Release()` called. Lock persists until TTL expires. Leaderless period = remaining TTL + follower acquisition interval. | `coordinator.go:304-336` |
 | **Backend resource deleted or permissions revoked** | DynamoDB table deleted, IAM policy changed | All operations return infrastructure errors. Permanent leaderless state. | All lock implementations |
+
+### Chaos Testing
+
+The documented failure modes above are validated by comprehensive chaos tests in `coordinator_chaos_test.go`. These tests serve as:
+
+1. **Regression Prevention**: Ensures documented behaviors remain consistent across code changes
+2. **Executable Documentation**: Demonstrates how failure modes manifest in practice
+3. **Validation**: Confirms protective measures (e.g., double-start protection) work correctly
+
+**Available Chaos Tests**:
+
+| Test | Failure Mode Tested | Verification |
+|------|---------------------|--------------|
+| `TestCoordinator_DoubleStart_GoroutineLeak` | Double Start() call (line 492) | Verifies second Start() returns error and no goroutines leak |
+| `TestCoordinator_ZombieLeader_AfterPanic` | Process crash without Stop() (line 525) | Measures TTL-based recovery time for zombie locks |
+| `TestCoordinator_ContextCancel_WithoutStop` | Stale leadership after context cancellation (line 493) | Confirms lock remains held until TTL expires |
+| `TestCoordinator_DuplicateOwnerID_SplitBrain` | Duplicate ownerID across processes (line 517) | Documents expected split-brain behavior |
+| `TestCoordinator_ThunderingHerd_Jitter` | Synchronized contention bursts (line 502) | Validates jitter spreads acquisition attempts |
+| `TestCoordinator_SlowBackend_InterTickExpiry` | Slow response causing inter-tick expiry (line 501) | Tests behavior when renewals take longer than RenewPeriod |
+| `TestCoordinator_StopTOCTOU_Race` | Stop() TOCTOU race (line 491) | Verifies graceful handling of concurrent demotion |
+| `TestCoordinator_MultipleFailureModes_Combined` | Combined slow + flaky backend | Tests resilience to multiple simultaneous failures |
+
+**Running Chaos Tests**:
+
+```bash
+# Run all chaos tests
+go test -v -run "TestCoordinator_" .
+
+# Run specific chaos test
+go test -v -run "TestCoordinator_DoubleStart_GoroutineLeak" .
+
+# Run with coverage to verify failure path coverage
+go test -cover .
+```
+
+**Test Helpers** (`coordinator_test_helpers.go`):
+
+The chaos tests use specialized locker wrappers for simulating failure conditions:
+
+- `TrackingLocker`: Records operation timestamps for analyzing timing behaviors
+- `DelayedLocker`: Injects artificial delays to simulate slow backends
+- `FlakyLocker`: Randomly fails operations to test error handling resilience
+
+These helpers enable testing failure modes without requiring actual infrastructure failures.

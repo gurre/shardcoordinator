@@ -604,3 +604,441 @@ func TestRoute53Lock_Conformance(t *testing.T) {
 		return locker
 	})
 }
+
+// TestDNSRecordNameConstruction validates that record names are constructed safely
+func TestDNSRecordNameConstruction(t *testing.T) {
+	tests := []struct {
+		name         string
+		recordPrefix string
+		shardID      string
+		domainName   string
+		expected     string
+	}{
+		{
+			name:         "standard DNS labels",
+			recordPrefix: "lock",
+			shardID:      "shard-1",
+			domainName:   "example.com",
+			expected:     "lock.shard-1.example.com",
+		},
+		{
+			name:         "numeric shard ID",
+			recordPrefix: "lock",
+			shardID:      "123",
+			domainName:   "example.com",
+			expected:     "lock.123.example.com",
+		},
+		{
+			name:         "hyphenated labels",
+			recordPrefix: "my-lock",
+			shardID:      "my-shard-123",
+			domainName:   "sub.example.com",
+			expected:     "my-lock.my-shard-123.sub.example.com",
+		},
+		{
+			name:         "underscores in labels",
+			recordPrefix: "lock_prefix",
+			shardID:      "shard_id",
+			domainName:   "example.com",
+			expected:     "lock_prefix.shard_id.example.com",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			locker, err := New(Config{
+				HostedZoneID: "Z123",
+				RecordPrefix: tt.recordPrefix,
+				DomainName:   tt.domainName,
+				Client:       newMockRoute53Client(),
+			})
+			if err != nil {
+				t.Fatalf("New() failed: %v", err)
+			}
+
+			result := locker.recordName(tt.shardID)
+			if result != tt.expected {
+				t.Errorf("recordName() = %q, expected %q", result, tt.expected)
+			}
+		})
+	}
+}
+
+// TestRecordValueConstruction validates that TXT record values are formatted correctly
+func TestRecordValueConstruction(t *testing.T) {
+	locker := &Route53Lock{}
+
+	tests := []struct {
+		name     string
+		ownerID  string
+		ttl      time.Time
+		validate func(string) bool
+	}{
+		{
+			name:    "standard owner ID",
+			ownerID: "worker-123",
+			ttl:     time.Unix(1700000000, 0),
+			validate: func(value string) bool {
+				return value == "\"worker-123 1700000000\""
+			},
+		},
+		{
+			name:    "owner ID with special chars",
+			ownerID: "host_name-123-abc",
+			ttl:     time.Unix(1700000000, 0),
+			validate: func(value string) bool {
+				return value == "\"host_name-123-abc 1700000000\""
+			},
+		},
+		{
+			name:    "zero timestamp",
+			ownerID: "owner",
+			ttl:     time.Unix(0, 0),
+			validate: func(value string) bool {
+				return value == "\"owner 0\""
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := locker.recordValue(tt.ownerID, tt.ttl)
+			if !tt.validate(result) {
+				t.Errorf("recordValue() = %q, validation failed", result)
+			}
+		})
+	}
+}
+
+// TestRecordValueParsing validates parsing of TXT record values with edge cases
+func TestRecordValueParsing(t *testing.T) {
+	locker := &Route53Lock{}
+
+	tests := []struct {
+		name        string
+		recordValue string
+		expectOwner string
+		expectTTL   int64
+		expectError bool
+	}{
+		{
+			name:        "valid standard format",
+			recordValue: "\"owner-123 1700000000\"",
+			expectOwner: "owner-123",
+			expectTTL:   1700000000,
+			expectError: false,
+		},
+		{
+			name:        "valid with underscores",
+			recordValue: "\"worker_abc_123 1700000000\"",
+			expectOwner: "worker_abc_123",
+			expectTTL:   1700000000,
+			expectError: false,
+		},
+		{
+			name:        "valid zero timestamp",
+			recordValue: "\"owner 0\"",
+			expectOwner: "owner",
+			expectTTL:   0,
+			expectError: false,
+		},
+		{
+			name:        "valid - missing quotes",
+			recordValue: "owner 1700000000",
+			expectOwner: "owner",
+			expectTTL:   1700000000,
+			expectError: false, // Trim handles missing quotes
+		},
+		{
+			name:        "invalid - no space delimiter",
+			recordValue: "\"owner1700000000\"",
+			expectOwner: "",
+			expectTTL:   0,
+			expectError: true,
+		},
+		{
+			name:        "invalid - non-numeric timestamp",
+			recordValue: "\"owner notanumber\"",
+			expectOwner: "",
+			expectTTL:   0,
+			expectError: true,
+		},
+		{
+			name:        "invalid - empty value",
+			recordValue: "\"\"",
+			expectOwner: "",
+			expectTTL:   0,
+			expectError: true,
+		},
+		{
+			name:        "invalid - only owner",
+			recordValue: "\"owner\"",
+			expectOwner: "",
+			expectTTL:   0,
+			expectError: true,
+		},
+		{
+			name:        "invalid - extra spaces",
+			recordValue: "\"owner  1700000000\"",
+			expectOwner: "owner",
+			expectTTL:   0,
+			expectError: true, // Second part is empty string, can't parse
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			record := &types.ResourceRecordSet{
+				ResourceRecords: []types.ResourceRecord{
+					{Value: aws.String(tt.recordValue)},
+				},
+			}
+
+			owner, ttl, err := locker.parseRecordValue(record)
+
+			if (err != nil) != tt.expectError {
+				t.Errorf("parseRecordValue() error = %v, expectError %v", err, tt.expectError)
+				return
+			}
+
+			if !tt.expectError {
+				if owner != tt.expectOwner {
+					t.Errorf("parseRecordValue() owner = %q, expected %q", owner, tt.expectOwner)
+				}
+				if ttl.Unix() != tt.expectTTL {
+					t.Errorf("parseRecordValue() ttl = %d, expected %d", ttl.Unix(), tt.expectTTL)
+				}
+			}
+		})
+	}
+}
+
+// TestParseRecordValue_EdgeCases tests edge cases in record value parsing
+func TestParseRecordValue_EdgeCases(t *testing.T) {
+	locker := &Route53Lock{}
+
+	tests := []struct {
+		name        string
+		record      *types.ResourceRecordSet
+		expectError bool
+		errorMsg    string
+	}{
+		{
+			name:        "nil record",
+			record:      nil,
+			expectError: true,
+			errorMsg:    "empty record",
+		},
+		{
+			name: "empty resource records",
+			record: &types.ResourceRecordSet{
+				ResourceRecords: []types.ResourceRecord{},
+			},
+			expectError: true,
+			errorMsg:    "empty record",
+		},
+		{
+			name: "nil value pointer",
+			record: &types.ResourceRecordSet{
+				ResourceRecords: []types.ResourceRecord{
+					{Value: nil},
+				},
+			},
+			expectError: true,
+			errorMsg:    "panic or error",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			defer func() {
+				if r := recover(); r != nil && !tt.expectError {
+					t.Errorf("parseRecordValue() panicked unexpectedly: %v", r)
+				}
+			}()
+
+			_, _, err := locker.parseRecordValue(tt.record)
+
+			if (err != nil) != tt.expectError {
+				t.Errorf("parseRecordValue() error = %v, expectError %v", err, tt.expectError)
+			}
+		})
+	}
+}
+
+// TestErrorDetection validates error classification functions
+func TestErrorDetection(t *testing.T) {
+	tests := []struct {
+		name              string
+		err               error
+		expectThrottling  bool
+		expectRetryable   bool
+		expectInvalidBatch bool
+	}{
+		{
+			name:               "throttling exception",
+			err:                &types.ThrottlingException{Message: aws.String("Rate exceeded")},
+			expectThrottling:   true,
+			expectRetryable:    true,
+			expectInvalidBatch: false,
+		},
+		{
+			name:               "invalid change batch",
+			err:                &types.InvalidChangeBatch{Message: aws.String("Conflict")},
+			expectThrottling:   false,
+			expectRetryable:    false,
+			expectInvalidBatch: true,
+		},
+		{
+			name:               "request timeout",
+			err:                errors.New("RequestTimeout: request timed out"),
+			expectThrottling:   false,
+			expectRetryable:    true,
+			expectInvalidBatch: false,
+		},
+		{
+			name:               "service unavailable",
+			err:                errors.New("ServiceUnavailable: service is unavailable"),
+			expectThrottling:   false,
+			expectRetryable:    true,
+			expectInvalidBatch: false,
+		},
+		{
+			name:               "internal error",
+			err:                errors.New("InternalError: internal server error"),
+			expectThrottling:   false,
+			expectRetryable:    true,
+			expectInvalidBatch: false,
+		},
+		{
+			name:               "other error",
+			err:                errors.New("some other error"),
+			expectThrottling:   false,
+			expectRetryable:    false,
+			expectInvalidBatch: false,
+		},
+		{
+			name:               "nil error",
+			err:                nil,
+			expectThrottling:   false,
+			expectRetryable:    false,
+			expectInvalidBatch: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if isThrottlingError(tt.err) != tt.expectThrottling {
+				t.Errorf("isThrottlingError() = %v, expected %v", isThrottlingError(tt.err), tt.expectThrottling)
+			}
+			if isRetryableError(tt.err) != tt.expectRetryable {
+				t.Errorf("isRetryableError() = %v, expected %v", isRetryableError(tt.err), tt.expectRetryable)
+			}
+			if isInvalidChangeBatchError(tt.err) != tt.expectInvalidBatch {
+				t.Errorf("isInvalidChangeBatchError() = %v, expected %v", isInvalidChangeBatchError(tt.err), tt.expectInvalidBatch)
+			}
+		})
+	}
+}
+
+// TestConfigValidation_DNSSafety validates DNS-safe configuration inputs
+func TestConfigValidation_DNSSafety(t *testing.T) {
+	mockClient := newMockRoute53Client()
+
+	tests := []struct {
+		name         string
+		hostedZoneID string
+		recordPrefix string
+		domainName   string
+		wantErr      bool
+		description  string
+	}{
+		{
+			name:         "valid standard config",
+			hostedZoneID: "Z1234567890ABC",
+			recordPrefix: "lock",
+			domainName:   "example.com",
+			wantErr:      false,
+			description:  "Standard valid configuration",
+		},
+		{
+			name:         "valid with subdomain",
+			hostedZoneID: "Z123",
+			recordPrefix: "coordination",
+			domainName:   "internal.example.com",
+			wantErr:      false,
+			description:  "Valid with subdomain",
+		},
+		{
+			name:         "valid with hyphens",
+			hostedZoneID: "Z-ABC-123",
+			recordPrefix: "my-lock",
+			domainName:   "my-domain.com",
+			wantErr:      false,
+			description:  "Valid with hyphens in labels",
+		},
+		{
+			name:         "valid with underscores",
+			hostedZoneID: "Z_123",
+			recordPrefix: "lock_prefix",
+			domainName:   "example.com",
+			wantErr:      false,
+			description:  "Valid with underscores (allowed in DNS TXT records)",
+		},
+		{
+			name:         "valid single character prefix",
+			hostedZoneID: "Z123",
+			recordPrefix: "l",
+			domainName:   "example.com",
+			wantErr:      false,
+			description:  "Valid with single character prefix",
+		},
+		{
+			name:         "valid long labels",
+			hostedZoneID: "Z" + strings.Repeat("A", 50),
+			recordPrefix: strings.Repeat("a", 63), // DNS label max is 63 chars
+			domainName:   "example.com",
+			wantErr:      false,
+			description:  "Valid with maximum length DNS labels",
+		},
+		{
+			name:         "empty hosted zone",
+			hostedZoneID: "",
+			recordPrefix: "lock",
+			domainName:   "example.com",
+			wantErr:      true,
+			description:  "Should reject empty hosted zone ID",
+		},
+		{
+			name:         "empty record prefix",
+			hostedZoneID: "Z123",
+			recordPrefix: "",
+			domainName:   "example.com",
+			wantErr:      true,
+			description:  "Should reject empty record prefix",
+		},
+		{
+			name:         "empty domain name",
+			hostedZoneID: "Z123",
+			recordPrefix: "lock",
+			domainName:   "",
+			wantErr:      true,
+			description:  "Should reject empty domain name",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := New(Config{
+				HostedZoneID: tt.hostedZoneID,
+				RecordPrefix: tt.recordPrefix,
+				DomainName:   tt.domainName,
+				Client:       mockClient,
+			})
+
+			if (err != nil) != tt.wantErr {
+				t.Errorf("%s: New() error = %v, wantErr %v", tt.description, err, tt.wantErr)
+			}
+		})
+	}
+}
